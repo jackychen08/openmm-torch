@@ -86,6 +86,10 @@ private:
     CUevent inputsReady = nullptr, modelDone = nullptr;
     torch::Tensor convertedForces;       // stream mode: the forces in OpenMM's precision, alive until the next call
     std::map<bool, at::cuda::CUDAGraph> graphs;
+    // Each graph's own output tensors (energy, force), keyed like graphs. A capture assigns energyTensor/forceTensor
+    // to that graph's outputs, so a replay must read back the outputs of the graph it replayed, not of the last one
+    // captured: an energy-only request once made every later force evaluation add the energy graph's stale forces.
+    std::map<bool, std::pair<torch::Tensor, torch::Tensor>> graphOutputs;
     void prepareTorchInputs(OpenMM::ContextImpl& context, std::vector<torch::jit::IValue>& inputs, std::map<std::string, torch::Tensor>& derivInputs);
     bool useGraphs, useOpenMMStream;
     void addForces(torch::Tensor& forceTensor);

@@ -335,12 +335,15 @@ double CudaCalcTorchForceKernel::execute(ContextImpl& context, bool includeForce
                 }
                 throw OpenMMException(string("TorchForce Failed to capture the model into a CUDA graph. Torch reported the following error:\n") + e.what());
             }
+            graphOutputs[includeForces] = std::make_pair(energyTensor, forceTensor);
             for (const string& name : paramDerivs)
                 globalTensors[name].grad().zero_();
             if (useOpenMMStream) {
                 CHECK_RESULT(cuCtxSynchronize(), "Failed to synchronize the CUDA context");
             }
         }
+        energyTensor = graphOutputs[includeForces].first;
+        forceTensor = graphOutputs[includeForces].second;
         if (useOpenMMStream)
             graphs[includeForces].replay();                 // on PyTorch's stream (the guard), gated by inputsReady
         else {
