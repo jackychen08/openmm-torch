@@ -22,6 +22,17 @@ void copyInputs(real* __restrict__ posTensor, real* __restrict__ boxTensor, cons
 }
 
 extern "C" __global__
+void copyVelocities(double* __restrict__ velTensor, const mixed4* __restrict__ velm, int* __restrict__ atomIndex, int numAtoms) {
+    for (int atom = blockIdx.x*blockDim.x+threadIdx.x; atom < numAtoms; atom += blockDim.x*gridDim.x) {
+        int index = atomIndex[atom];
+        mixed4 v = velm[atom];
+        velTensor[3*index] = (double) v.x;
+        velTensor[3*index+1] = (double) v.y;
+        velTensor[3*index+2] = (double) v.z;
+    }
+}
+
+extern "C" __global__
 void addForces(const real* __restrict__ grads, long long* __restrict__ forceBuffers, int* __restrict__ atomIndex, int numAtoms, int paddedNumAtoms, int forceSign) {
     for (int atom = blockIdx.x*blockDim.x+threadIdx.x; atom < numAtoms; atom += blockDim.x*gridDim.x) {
         int index = atomIndex[atom];

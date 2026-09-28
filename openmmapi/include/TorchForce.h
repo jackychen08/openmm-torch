@@ -104,6 +104,54 @@ public:
      */
     bool getOutputsForces() const;
     /**
+     * Set whether the network also receives the atomic velocities (nm/ps, System atom order, always double
+     * precision: OpenMM keeps velocities in double in mixed and double precision) as its second input, after
+     * the positions. The velocities are those the
+     * integrator stores when the force is evaluated. Only the Reference and CUDA platforms support this;
+     * other platforms throw an exception rather than ignore it.
+     */
+    void setUsesVelocities(bool usesVelocities);
+    /**
+     * Get whether the network receives the atomic velocities.
+     */
+    bool usesVelocities() const;
+    /**
+     * Pass a float32 buffer owned by the caller to the network as an extra 1-D input tensor. Inputs are
+     * ordered: positions, velocities (if used), box vectors (if periodic), external tensors in the order
+     * added, then global parameters. The network may read the buffer and write to it in place; the caller may
+     * update it between steps, and the change is seen by the next evaluation (with or without CUDA graphs).
+     *
+     * On the CUDA platform the pointer must be device memory in the primary context of the context's device
+     * (for example torch.Tensor.data_ptr() of a CUDA tensor on that device); on the Reference platform it
+     * must be host memory. The caller must keep the buffer alive, and must not reallocate it, for the whole
+     * lifetime of every Context created from this force. A force with external tensors cannot be serialized.
+     * With the property useOpenMMStream set to "true" (CUDA), the model runs on OpenMM's stream without
+     * synchronizing the context: synchronize the device after writing a buffer from another stream and before
+     * reading one on the host.
+     *
+     * @param name          a label used in error messages
+     * @param pointer       the address of the first float32 element
+     * @param numElements   the number of float32 elements
+     * @return the index of the external tensor
+     */
+    int addExternalTensor(const std::string& name, long long pointer, int numElements);
+    /**
+     * Get the number of external tensors.
+     */
+    int getNumExternalTensors() const;
+    /**
+     * Get the label of an external tensor.
+     */
+    const std::string& getExternalTensorName(int index) const;
+    /**
+     * Get the address of an external tensor.
+     */
+    long long getExternalTensorPointer(int index) const;
+    /**
+     * Get the number of float32 elements of an external tensor.
+     */
+    int getExternalTensorSize(int index) const;
+    /**
      * Get the number of global parameters that the interaction depends on.
      */
     int getNumGlobalParameters() const;
@@ -182,8 +230,11 @@ protected:
 private:
     class GlobalParameterInfo;
     std::string file;
-    bool usePeriodic, outputsForces;
+    bool usePeriodic, outputsForces, useVelocities;
     std::vector<GlobalParameterInfo> globalParameters;
+    std::vector<std::string> externalNames;
+    std::vector<long long> externalPointers;
+    std::vector<int> externalSizes;
     std::vector<int> energyParameterDerivatives;
     torch::jit::Module module;
     std::map<std::string, std::string> properties;

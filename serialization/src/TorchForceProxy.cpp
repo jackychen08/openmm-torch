@@ -74,8 +74,10 @@ TorchForceProxy::TorchForceProxy() : SerializationProxy("TorchForce") {
 }
 
 void TorchForceProxy::serialize(const void* object, SerializationNode& node) const {
-    node.setIntProperty("version", 4);
+    node.setIntProperty("version", 5);
     const TorchForce& force = *reinterpret_cast<const TorchForce*>(object);
+    if (force.getNumExternalTensors() > 0)
+        throw OpenMMException("TorchForceProxy: a TorchForce with external tensors cannot be serialized (their addresses are process-local)");
     node.setStringProperty("file", force.getFile());
     try {
         auto tempFileName = std::tmpnam(nullptr);
@@ -89,6 +91,7 @@ void TorchForceProxy::serialize(const void* object, SerializationNode& node) con
     node.setIntProperty("forceGroup", force.getForceGroup());
     node.setBoolProperty("usesPeriodic", force.usesPeriodicBoundaryConditions());
     node.setBoolProperty("outputsForces", force.getOutputsForces());
+    node.setBoolProperty("usesVelocities", force.usesVelocities());
     SerializationNode& globalParams = node.createChildNode("GlobalParameters");
     for (int i = 0; i < force.getNumGlobalParameters(); i++)
         globalParams.createChildNode("Parameter").setStringProperty("name", force.getGlobalParameterName(i)).setDoubleProperty("default", force.getGlobalParameterDefaultValue(i));
@@ -102,7 +105,7 @@ void TorchForceProxy::serialize(const void* object, SerializationNode& node) con
 
 void* TorchForceProxy::deserialize(const SerializationNode& node) const {
     int storedVersion = node.getIntProperty("version");
-    if (storedVersion > 4)
+    if (storedVersion > 5)
         throw OpenMMException("Unsupported version number");
     TorchForce* force;
     if (storedVersion == 1) {
@@ -124,6 +127,8 @@ void* TorchForceProxy::deserialize(const SerializationNode& node) const {
         force->setUsesPeriodicBoundaryConditions(node.getBoolProperty("usesPeriodic"));
     if (node.hasProperty("outputsForces"))
         force->setOutputsForces(node.getBoolProperty("outputsForces"));
+    if (node.hasProperty("usesVelocities"))
+        force->setUsesVelocities(node.getBoolProperty("usesVelocities"));
     for (const SerializationNode& child : node.getChildren()) {
         if (child.getName() == "GlobalParameters")
             for (auto& parameter : child.getChildren())

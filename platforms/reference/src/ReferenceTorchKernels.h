@@ -69,7 +69,8 @@ private:
     std::vector<float> positions, boxVectors;
     std::vector<std::string> globalNames;
     std::set<std::string> paramDerivs;
-    bool usePeriodic, outputsForces;
+    bool usePeriodic, outputsForces, useVelocities;
+    std::vector<torch::Tensor> externalTensors;
 };
 
 } // namespace TorchPlugin

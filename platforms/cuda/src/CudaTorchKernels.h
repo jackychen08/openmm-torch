@@ -37,6 +37,8 @@
 #include "openmm/cuda/CudaArray.h"
 #include <torch/version.h>
 #include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAStream.h>
+#include <optional>
 #include <set>
 
 namespace TorchPlugin {
@@ -70,17 +72,22 @@ private:
     bool hasInitializedKernel;
     OpenMM::CudaContext& cu;
     torch::jit::script::Module module;
-    torch::Tensor posTensor, boxTensor;
+    torch::Tensor posTensor, velTensor, boxTensor;
     torch::Tensor energyTensor, forceTensor;
     std::map<std::string, torch::Tensor> globalTensors;
     std::vector<std::string> globalNames;
     std::set<std::string> paramDerivs;
-    bool usePeriodic, outputsForces;
-    CUfunction copyInputsKernel, addForcesKernel;
+    bool usePeriodic, outputsForces, useVelocities;
+    std::vector<torch::Tensor> externalTensors;
+    CUfunction copyInputsKernel, copyVelocitiesKernel, addForcesKernel;
     CUcontext primaryContext;
+    // useOpenMMStream: PyTorch runs on its own stream, ordered against OpenMM's stream by events, with no host waits.
+    std::optional<c10::cuda::CUDAStream> torchStream;
+    CUevent inputsReady = nullptr, modelDone = nullptr;
+    torch::Tensor convertedForces;       // stream mode: the forces in OpenMM's precision, alive until the next call
     std::map<bool, at::cuda::CUDAGraph> graphs;
     void prepareTorchInputs(OpenMM::ContextImpl& context, std::vector<torch::jit::IValue>& inputs, std::map<std::string, torch::Tensor>& derivInputs);
-    bool useGraphs;
+    bool useGraphs, useOpenMMStream;
     void addForces(torch::Tensor& forceTensor);
     int warmupSteps;
 };

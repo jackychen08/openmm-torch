@@ -44,6 +44,11 @@ static vector<Vec3>& extractPositions(ContextImpl& context) {
     return *data->positions;
 }
 
+static vector<Vec3>& extractVelocities(ContextImpl& context) {
+    ReferencePlatform::PlatformData* data = reinterpret_cast<ReferencePlatform::PlatformData*>(context.getPlatformData());
+    return *data->velocities;
+}
+
 static vector<Vec3>& extractForces(ContextImpl& context) {
     ReferencePlatform::PlatformData* data = reinterpret_cast<ReferencePlatform::PlatformData*>(context.getPlatformData());
     return *data->forces;
@@ -68,6 +73,10 @@ void ReferenceCalcTorchForceKernel::initialize(const System& system, const Torch
     this->module = torch::jit::freeze(this->module);
     usePeriodic = force.usesPeriodicBoundaryConditions();
     outputsForces = force.getOutputsForces();
+    useVelocities = force.usesVelocities();
+    for (int i = 0; i < force.getNumExternalTensors(); i++)
+        externalTensors.push_back(torch::from_blob(reinterpret_cast<void*>(force.getExternalTensorPointer(i)),
+                                                   {(int64_t) force.getExternalTensorSize(i)}, torch::kFloat32));
     for (int i = 0; i < force.getNumGlobalParameters(); i++)
         globalNames.push_back(force.getGlobalParameterName(i));
     for (int i = 0; i < force.getNumEnergyParameterDerivatives(); i++)
@@ -80,11 +89,17 @@ double ReferenceCalcTorchForceKernel::execute(ContextImpl& context, bool include
     int numParticles = pos.size();
     torch::Tensor posTensor = torch::from_blob(pos.data(), {numParticles, 3}, torch::TensorOptions().dtype(torch::kFloat64).requires_grad(true));
     vector<torch::jit::IValue> inputs = {posTensor};
+    if (useVelocities) {
+        vector<Vec3>& vel = extractVelocities(context);
+        inputs.push_back(torch::from_blob(vel.data(), {numParticles, 3}, torch::kFloat64));
+    }
     if (usePeriodic) {
         Vec3* box = extractBoxVectors(context);
         torch::Tensor boxTensor = torch::from_blob(box, {3, 3}, torch::kFloat64);
         inputs.push_back(boxTensor);
     }
+    for (torch::Tensor& tensor : externalTensors)
+        inputs.push_back(tensor);
     map<string, torch::Tensor> derivInputs;
     for (const string& name : globalNames) {
         bool requiresGrad = (paramDerivs.find(name) != paramDerivs.end());

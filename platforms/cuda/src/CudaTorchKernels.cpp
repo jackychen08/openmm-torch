@@ -30,6 +30,7 @@
  * -------------------------------------------------------------------------- */
 
 #include "CudaTorchKernels.h"
+#include <optional>
 #include "CudaTorchKernelSources.h"
 #include "openmm/common/ContextSelector.h"
 #include "openmm/internal/ContextImpl.h"
@@ -57,6 +58,10 @@ CudaCalcTorchForceKernel::CudaCalcTorchForceKernel(string name, const Platform& 
 }
 
 CudaCalcTorchForceKernel::~CudaCalcTorchForceKernel() {
+    if (inputsReady != nullptr)
+        cuEventDestroy(inputsReady);
+    if (modelDone != nullptr)
+        cuEventDestroy(modelDone);
     cuDevicePrimaryCtxRelease(cu.getDevice());
 }
 
@@ -64,6 +69,7 @@ void CudaCalcTorchForceKernel::initialize(const System& system, const TorchForce
     this->module = module;
     usePeriodic = force.usesPeriodicBoundaryConditions();
     outputsForces = force.getOutputsForces();
+    useVelocities = force.usesVelocities();
     for (int i = 0; i < force.getNumGlobalParameters(); i++)
         globalNames.push_back(force.getGlobalParameterName(i));
     for (int i = 0; i < force.getNumEnergyParameterDerivatives(); i++) {
@@ -84,7 +90,24 @@ void CudaCalcTorchForceKernel::initialize(const System& system, const TorchForce
     this->module = torch::jit::freeze(this->module);
     torch::TensorOptions options = torch::TensorOptions().device(device).dtype(cu.getUseDoublePrecision() ? torch::kFloat64 : torch::kFloat32);
     posTensor = torch::empty({numParticles, 3}, options.requires_grad(!outputsForces));
+    // Velocities are passed in double precision on every platform: in mixed precision OpenMM stores them as double.
+    velTensor = torch::empty({numParticles, 3}, options.dtype(torch::kFloat64));
     boxTensor = torch::empty({3, 3}, options);
+    for (int i = 0; i < force.getNumExternalTensors(); i++) {
+        // Only device memory of this context's device is accepted; anything else would be read by the GPU as garbage.
+        CUdeviceptr pointer = (CUdeviceptr) force.getExternalTensorPointer(i);
+        unsigned int memoryType = 0;
+        int ordinal = -1;
+        if (cuPointerGetAttribute(&memoryType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, pointer) != CUDA_SUCCESS ||
+                memoryType != CU_MEMORYTYPE_DEVICE ||
+                cuPointerGetAttribute(&ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, pointer) != CUDA_SUCCESS ||
+                ordinal != cu.getDeviceIndex())
+            throw OpenMMException("TorchForce: external tensor '" + force.getExternalTensorName(i) +
+                                  "' is not device memory on the context's device");
+        externalTensors.push_back(torch::from_blob(reinterpret_cast<void*>(pointer),
+                                                   {(int64_t) force.getExternalTensorSize(i)},
+                                                   torch::TensorOptions().device(device).dtype(torch::kFloat32)));
+    }
     energyTensor = torch::empty({0}, options);
     forceTensor = torch::empty({0}, options);
     for (const string& name : globalNames)
@@ -99,6 +122,7 @@ void CudaCalcTorchForceKernel::initialize(const System& system, const TorchForce
     map<string, string> defines;
     CUmodule program = cu.createModule(CudaTorchKernelSources::torchForce, defines);
     copyInputsKernel = cu.getKernel(program, "copyInputs");
+    copyVelocitiesKernel = cu.getKernel(program, "copyVelocities");
     addForcesKernel = cu.getKernel(program, "addForces");
     auto properties = force.getProperties();
     const std::string useCUDAGraphsString = properties["useCUDAGraphs"];
@@ -113,6 +137,27 @@ void CudaCalcTorchForceKernel::initialize(const System& system, const TorchForce
         if (this->warmupSteps <= 0) {
             throw OpenMMException("TorchForce: \"CUDAGraphWarmupSteps\" must be a positive integer");
         }
+    }
+    // useOpenMMStream: no host waits inside a call. OpenMM runs in its own CUDA context and PyTorch in the device's
+    // primary context, so their streams cannot be shared; instead an event recorded on OpenMM's stream after the
+    // inputs are copied gates PyTorch's stream, and an event recorded on PyTorch's stream after the model gates
+    // OpenMM's stream before the forces are added (a stream may wait on an event of another context on the device).
+    // The energy is read only when requested, since reading it waits for the model.
+    const std::string useOpenMMStreamString = properties["useOpenMMStream"];
+    if (useOpenMMStreamString == "true")
+        useOpenMMStream = true;
+    else if (useOpenMMStreamString == "false" || useOpenMMStreamString == "")
+        useOpenMMStream = false;
+    else
+        throw OpenMMException("TorchForce: invalid value of \"useOpenMMStream\"");
+    if (useOpenMMStream) {
+        CHECK_RESULT(cuCtxPushCurrent(primaryContext), "Failed to push the CUDA context");
+        torchStream = c10::cuda::getStreamFromPool(false, cu.getDeviceIndex());
+        CHECK_RESULT(cuEventCreate(&modelDone, CU_EVENT_DISABLE_TIMING), "Failed to create a CUDA event");
+        CUcontext ctx;
+        CHECK_RESULT(cuCtxPopCurrent(&ctx), "Failed to pop the CUDA context");
+        ContextSelector selector(cu);
+        CHECK_RESULT(cuEventCreate(&inputsReady, CU_EVENT_DISABLE_TIMING), "Failed to create a CUDA event");
     }
 }
 
@@ -150,12 +195,28 @@ void CudaCalcTorchForceKernel::prepareTorchInputs(ContextImpl& context, vector<t
                              cu.getPeriodicBoxVecYPointer(),
                              cu.getPeriodicBoxVecZPointer()};
         cu.executeKernel(copyInputsKernel, inputArgs, numParticles);
-        CHECK_RESULT(cuCtxSynchronize(), "Failed to synchronize the CUDA context"); // Synchronize before switching to the PyTorch context
+        if (useVelocities) {
+            void* velData = velTensor.data_ptr<double>();
+            void* velArgs[] = {&velData, &cu.getVelm().getDevicePointer(), &cu.getAtomIndexArray().getDevicePointer(), &numParticles};
+            cu.executeKernel(copyVelocitiesKernel, velArgs, numParticles);
+        }
+        if (useOpenMMStream) {
+            CHECK_RESULT(cuEventRecord(inputsReady, cu.getCurrentStream()), "Failed to record a CUDA event");
+        } else {
+            CHECK_RESULT(cuCtxSynchronize(), "Failed to synchronize the CUDA context"); // Synchronize before switching to the PyTorch context
+        }
+    }
+    if (useOpenMMStream) {
+        CHECK_RESULT(cuStreamWaitEvent(torchStream->stream(), inputsReady, 0), "Failed to wait for a CUDA event");
     }
     // Prepare the input of the PyTorch model
     inputs = {posTensor};
+    if (useVelocities)
+        inputs.push_back(velTensor);
     if (usePeriodic)
         inputs.push_back(boxTensor);
+    for (torch::Tensor& tensor : externalTensors)
+        inputs.push_back(tensor);
     for (const string& name : globalNames) {
         // PyTorch requires us to set requires_grad to false before initializing a tensor.
         globalTensors[name].set_requires_grad(false);
@@ -173,15 +234,22 @@ void CudaCalcTorchForceKernel::addForces(torch::Tensor& forceTensor) {
     int numParticles = cu.getNumAtoms();
     // Get a pointer to the computed forces
     void* forceData = getTensorPointer(cu, forceTensor);
-    CHECK_RESULT(cuCtxSynchronize(), "Failed to synchronize the CUDA context"); // Synchronize before switching to the OpenMM context
+    if (!useOpenMMStream) {
+        CHECK_RESULT(cuCtxSynchronize(), "Failed to synchronize the CUDA context"); // Synchronize before switching to the OpenMM context
+    }
     // Add the computed forces to the total atomic forces
     {
         ContextSelector selector(cu); // Switch to the OpenMM context
+        if (useOpenMMStream) {
+            CHECK_RESULT(cuStreamWaitEvent(cu.getCurrentStream(), modelDone, 0), "Failed to wait for a CUDA event");
+        }
         int paddedNumAtoms = cu.getPaddedNumAtoms();
         int forceSign = (outputsForces ? 1 : -1);
         void* forceArgs[] = {&forceData, &cu.getForce().getDevicePointer(), &cu.getAtomIndexArray().getDevicePointer(), &numParticles, &paddedNumAtoms, &forceSign};
         cu.executeKernel(addForcesKernel, forceArgs, numParticles);
-        CHECK_RESULT(cuCtxSynchronize(), "Failed to synchronize the CUDA context"); // Synchronize before switching to the PyTorch context
+        if (!useOpenMMStream) {
+            CHECK_RESULT(cuCtxSynchronize(), "Failed to synchronize the CUDA context"); // Synchronize before switching to the PyTorch context
+        }
     }
 }
 
@@ -224,6 +292,9 @@ static void executeGraph(bool outputsForces, bool includeForces, torch::jit::scr
 double CudaCalcTorchForceKernel::execute(ContextImpl& context, bool includeForces, bool includeEnergy) {
     // Push to the PyTorch context
     CHECK_RESULT(cuCtxPushCurrent(primaryContext), "Failed to push the CUDA context");
+    std::optional<c10::cuda::CUDAStreamGuard> torchStreamGuard;
+    if (useOpenMMStream)
+        torchStreamGuard.emplace(*torchStream);
     vector<torch::jit::IValue> inputs;
     prepareTorchInputs(context, inputs, globalTensors);
     if (!useGraphs) {
@@ -232,6 +303,11 @@ double CudaCalcTorchForceKernel::execute(ContextImpl& context, bool includeForce
         // Record graph if not already done
         bool is_graph_captured = false;
         if (graphs.find(includeForces) == graphs.end()) {
+            // Warm-up and capture run on a side stream: in stream mode the inputs queued on OpenMM's stream must be
+            // complete first, and the side stream's work before PyTorch's stream continues (once per graph).
+            if (useOpenMMStream) {
+                CHECK_RESULT(cuEventSynchronize(inputsReady), "Failed to wait for a CUDA event");
+            }
 	    //CUDA graph capture must occur in a non-default stream
             const auto stream = c10::cuda::getStreamFromPool(false, cu.getDeviceIndex());
 	        const c10::cuda::CUDAStreamGuard guard(stream);
@@ -261,23 +337,47 @@ double CudaCalcTorchForceKernel::execute(ContextImpl& context, bool includeForce
             }
             for (const string& name : paramDerivs)
                 globalTensors[name].grad().zero_();
+            if (useOpenMMStream) {
+                CHECK_RESULT(cuCtxSynchronize(), "Failed to synchronize the CUDA context");
+            }
         }
-        // Use the same stream as the OpenMM context, even if it is the default stream
-        const auto openmmStream = cu.getCurrentStream();
-        const auto stream = c10::cuda::getStreamFromExternal(openmmStream, cu.getDeviceIndex());
-        const c10::cuda::CUDAStreamGuard guard(stream);
-        graphs[includeForces].replay();
+        if (useOpenMMStream)
+            graphs[includeForces].replay();                 // on PyTorch's stream (the guard), gated by inputsReady
+        else {
+            // Use the same stream as the OpenMM context, even if it is the default stream
+            const auto openmmStream = cu.getCurrentStream();
+            const auto stream = c10::cuda::getStreamFromExternal(openmmStream, cu.getDeviceIndex());
+            const c10::cuda::CUDAStreamGuard guard(stream);
+            graphs[includeForces].replay();
+        }
+    }
+    if (useOpenMMStream) {
+        // Convert on PyTorch's stream before the event, into a member that outlives the kernel reading it on
+        // OpenMM's stream. Not into forceTensor: with CUDA graphs that is the graph's output buffer, and replacing it
+        // made every later call add the first call's forces (caught by test_velocities_reach_the_model_in_system_order
+        // with a float64 model output). OpenMM's stream waits for the model even without forces, so its next input
+        // copy cannot overwrite what the model reads.
+        if (includeForces)
+            convertedForces = forceTensor.to(cu.getUseDoublePrecision() ? torch::kFloat64 : torch::kFloat32);
+        CHECK_RESULT(cuEventRecord(modelDone, torchStream->stream()), "Failed to record a CUDA event");
+        if (!includeForces) {
+            ContextSelector selector(cu);
+            CHECK_RESULT(cuStreamWaitEvent(cu.getCurrentStream(), modelDone, 0), "Failed to wait for a CUDA event");
+        }
     }
     if (includeForces) {
-        addForces(forceTensor);
+        addForces(useOpenMMStream ? convertedForces : forceTensor);
     }
     map<string, double>& energyParamDerivs = cu.getEnergyParamDerivWorkspace();
     for (const string& name : paramDerivs) {
         energyParamDerivs[name] += globalTensors[name].grad().item<double>();
         globalTensors[name].grad().zero_();
     }
-    // Get energy
-    const double energy = energyTensor.item<double>(); // This implicitly synchronizes the PyTorch context
+    // Get energy. In stream mode only when it was requested: reading it waits for the whole stream.
+    double energy = 0.0;
+    if (!useOpenMMStream || includeEnergy)
+        energy = energyTensor.item<double>(); // This implicitly synchronizes the PyTorch context
+    torchStreamGuard.reset();
     // Pop to the PyTorch context
     CUcontext ctx;
     CHECK_RESULT(cuCtxPopCurrent(&ctx), "Failed to pop the CUDA context");

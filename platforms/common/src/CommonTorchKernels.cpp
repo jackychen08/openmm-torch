@@ -42,6 +42,8 @@ CommonCalcTorchForceKernel::~CommonCalcTorchForceKernel() {
 }
 
 void CommonCalcTorchForceKernel::initialize(const System& system, const TorchForce& force, torch::jit::script::Module& module) {
+    if (force.usesVelocities() || force.getNumExternalTensors() > 0)
+        throw OpenMMException("TorchForce: velocities and external tensors are supported only on the Reference and CUDA platforms");
     this->module = module;
     usePeriodic = force.usesPeriodicBoundaryConditions();
     outputsForces = force.getOutputsForces();

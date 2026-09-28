@@ -41,8 +41,8 @@ using namespace TorchPlugin;
 using namespace OpenMM;
 using namespace std;
 
-TorchForce::TorchForce(const torch::jit::Module& module, const map<string, string>& properties) : file(), usePeriodic(false), outputsForces(false), module(module) {
-    const std::map<std::string, std::string> defaultProperties = {{"useCUDAGraphs", "false"}, {"CUDAGraphWarmupSteps", "10"}};
+TorchForce::TorchForce(const torch::jit::Module& module, const map<string, string>& properties) : file(), usePeriodic(false), outputsForces(false), useVelocities(false), module(module) {
+    const std::map<std::string, std::string> defaultProperties = {{"useCUDAGraphs", "false"}, {"CUDAGraphWarmupSteps", "10"}, {"useOpenMMStream", "false"}};
     this->properties = defaultProperties;
     for (auto& property : properties) {
         if (defaultProperties.find(property.first) == defaultProperties.end())
@@ -81,6 +81,44 @@ void TorchForce::setOutputsForces(bool outputsForces) {
 
 bool TorchForce::getOutputsForces() const {
     return outputsForces;
+}
+
+void TorchForce::setUsesVelocities(bool usesVelocities) {
+    useVelocities = usesVelocities;
+}
+
+bool TorchForce::usesVelocities() const {
+    return useVelocities;
+}
+
+int TorchForce::addExternalTensor(const string& name, long long pointer, int numElements) {
+    if (pointer == 0)
+        throw OpenMMException("TorchForce: external tensor '" + name + "' has a null pointer");
+    if (numElements <= 0)
+        throw OpenMMException("TorchForce: external tensor '" + name + "' must have a positive size");
+    externalNames.push_back(name);
+    externalPointers.push_back(pointer);
+    externalSizes.push_back(numElements);
+    return externalNames.size() - 1;
+}
+
+int TorchForce::getNumExternalTensors() const {
+    return externalNames.size();
+}
+
+const string& TorchForce::getExternalTensorName(int index) const {
+    ASSERT_VALID_INDEX(index, externalNames);
+    return externalNames[index];
+}
+
+long long TorchForce::getExternalTensorPointer(int index) const {
+    ASSERT_VALID_INDEX(index, externalPointers);
+    return externalPointers[index];
+}
+
+int TorchForce::getExternalTensorSize(int index) const {
+    ASSERT_VALID_INDEX(index, externalSizes);
+    return externalSizes[index];
 }
 
 int TorchForce::addGlobalParameter(const string& name, double defaultValue) {

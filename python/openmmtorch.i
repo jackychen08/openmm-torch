@@ -83,6 +83,13 @@ public:
     bool usesPeriodicBoundaryConditions() const;
     void setOutputsForces(bool);
     bool getOutputsForces() const;
+    void setUsesVelocities(bool usesVelocities);
+    bool usesVelocities() const;
+    int addExternalTensor(const std::string& name, long long pointer, int numElements);
+    int getNumExternalTensors() const;
+    const std::string& getExternalTensorName(int index) const;
+    long long getExternalTensorPointer(int index) const;
+    int getExternalTensorSize(int index) const;
     int getNumGlobalParameters() const;
     int getNumEnergyParameterDerivatives() const;
     int addGlobalParameter(const std::string& name, double defaultValue);
